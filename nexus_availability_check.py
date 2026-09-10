@@ -70,6 +70,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -106,6 +107,9 @@ ST_MOD_GONE = "VERIFY NEXUS AVAILABILITY"   # mod page unreachable
 ST_FILE_GONE = "VERIFY NEXUS AVAILABILITY"  # file no longer listed
 ST_ERROR = "ERROR"
 ST_SKIPPED = "SKIPPED"
+ST_DOWNLOADING = "DOWNLOADING"
+ST_DOWNLOADED = "DOWNLOADED"
+ST_DL_FAILED = "DOWNLOAD FAILED"
 
 FLAGGED_STATES = {ST_MOD_GONE, ST_FILE_GONE}
 
@@ -296,6 +300,53 @@ def scan_downloads(downloads_path: str, require_archive: bool) -> List[Entry]:
     return entries
 
 
+def installed_file_ids(mod_path: str) -> List[Tuple[int, int]]:
+    """Read (modID, fileID) pairs from an installed mod's meta.ini.
+
+    MO2 records what was installed into a mod under [installedFiles], e.g.
+
+        [installedFiles]
+        1\\modid=598
+        1\\fileid=678881
+        size=1
+
+    This is the only place the file ID survives once the download and its
+    .meta have been deleted, so it is what makes re-downloading possible.
+    """
+    meta_ini = os.path.join(mod_path, "meta.ini")
+    if not os.path.isfile(meta_ini):
+        return []
+
+    mod_ids: Dict[str, int] = {}
+    file_ids: Dict[str, int] = {}
+    try:
+        with open(meta_ini, "r", encoding="utf-8", errors="replace") as handle:
+            raw = handle.read()
+    except OSError:
+        return []
+
+    section = re.search(
+        r"^\[installedFiles\]\s*$(.*?)(?=^\[|\Z)", raw, re.MULTILINE | re.DOTALL
+    )
+    if section:
+        body = section.group(1)
+        for index, value in re.findall(
+            r"^\s*(\d+)\\+modid\s*=\s*(\d+)", body, re.MULTILINE | re.IGNORECASE
+        ):
+            mod_ids[index] = int(value)
+        for index, value in re.findall(
+            r"^\s*(\d+)\\+fileid\s*=\s*(\d+)", body, re.MULTILINE | re.IGNORECASE
+        ):
+            file_ids[index] = int(value)
+
+    pairs: List[Tuple[int, int]] = []
+    for index, file_id in sorted(file_ids.items(), key=lambda kv: int(kv[0])):
+        mod_id = mod_ids.get(index, 0)
+        if file_id > 0:
+            pairs.append((mod_id, file_id))
+    return pairs
+
+
 def scan_installed_mods(organizer: mobase.IOrganizer) -> List[Entry]:
     """Installed mods that carry a Nexus ID, for archives no longer on disk."""
     entries: List[Entry] = []
@@ -334,12 +385,23 @@ def scan_installed_mods(organizer: mobase.IOrganizer) -> List[Entry]:
         except Exception:
             version = ""
 
+        # Recover the file ID from meta.ini so the archive can be re-downloaded
+        # even though its download entry (and .meta) are long gone.
+        file_id: Optional[int] = None
+        try:
+            for candidate_mod, candidate_file in installed_file_ids(mod.absolutePath()):
+                if candidate_mod in (0, mod_id):
+                    file_id = candidate_file
+                    break
+        except Exception:
+            file_id = None
+
         entries.append(
             Entry(
                 source="mod",
                 game=game,
                 mod_id=mod_id,
-                file_id=None,
+                file_id=file_id,
                 archive=os.path.basename(archive),
                 mod_name=mod_name,
                 display_name=mod_name,
@@ -350,9 +412,23 @@ def scan_installed_mods(organizer: mobase.IOrganizer) -> List[Entry]:
 
 
 def dedupe(entries: Iterable[Entry]) -> List[Entry]:
-    seen: Set[Tuple[str, int, Optional[int], str]] = set()
+    entries = list(entries)
+    # A download meta carries the file ID, so prefer it over the installed-mod
+    # view of the same Nexus mod instead of listing both.
+    from_downloads = {
+        (e.game.lower(), e.mod_id)
+        for e in entries
+        if e.source == "download" and e.kind == KIND_NEXUS and e.mod_id
+    }
+    seen: Set[Tuple[Any, ...]] = set()
     out: List[Entry] = []
     for entry in entries:
+        if (
+            entry.source == "mod"
+            and entry.kind == KIND_NEXUS
+            and (entry.game.lower(), entry.mod_id) in from_downloads
+        ):
+            continue
         marker = (entry.kind, entry.game.lower(), entry.mod_id, entry.file_id, entry.url, entry.source)
         if marker in seen:
             continue
@@ -961,7 +1037,7 @@ class UrlChecker(QObject):
         if any(lowered.startswith(prefix) for prefix in self._whitelist):
             return ""
         host = _host_of(url)
-        if host.endswith("nexusmods.com") or host.endswith("github.com"):
+        if host.endswith(("nexusmods.com", "github.com", "wabbajack.org")):
             return ""
         return " NOT on the Wabbajack server whitelist - compilation will reject it"
 
@@ -983,6 +1059,18 @@ class UrlChecker(QObject):
         from PyQt6.QtNetwork import QNetworkRequest
 
         entry = self._entries[index]
+        host = _host_of(entry.url)
+        if host in OPAQUE_HOSTS and not use_get:
+            # No point spending a request: these answer identically whether the
+            # file is live or deleted, and they stall on HEAD until timeout.
+            self._resolve(
+                index,
+                ST_ERROR,
+                f"Not checkable automatically - {OPAQUE_HOSTS[host]}. Open the link "
+                f"and confirm by hand{self._whitelist_note(entry.url)}",
+            )
+            return
+
         url = _QUrl(entry.url)
         if not url.isValid() or not entry.url.lower().startswith(("http://", "https://")):
             self._resolve(index, ST_MOD_GONE, f"'{entry.url}' is not a usable http(s) URL")
@@ -1153,6 +1241,307 @@ class UrlChecker(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Fetching missing archives through MO2's own download manager
+# ---------------------------------------------------------------------------
+
+
+def manual_download_url(organizer: mobase.IOrganizer, entry: Entry) -> str:
+    """A link the user can click to fetch this by hand.
+
+    For Nexus entries with a known file ID this builds the mod-manager download
+    link (nmm=1), which hands MO2 an nxm:// link through the browser. That path
+    works without Premium, unlike the download API.
+    """
+    if entry.kind != KIND_NEXUS:
+        return entry.url
+    domain = nexus_domain(organizer, entry.game)
+    base = f"https://www.nexusmods.com/{domain}/mods/{entry.mod_id}"
+    if entry.file_id:
+        return f"{base}?tab=files&file_id={entry.file_id}&nmm=1"
+    return f"{base}?tab=files"
+
+
+def archive_missing(entry: Entry, downloads_path: str) -> bool:
+    if entry.archive:
+        return not os.path.isfile(os.path.join(downloads_path, entry.archive))
+    # An installed-mod entry only survives deduplication when no download meta
+    # references it, so there is nothing in the downloads folder for it.
+    return entry.source == "mod"
+
+
+def managed_game_identifiers(organizer: mobase.IOrganizer) -> Tuple[Set[str], str]:
+    """Every name the managed game answers to, lowercased, plus a display name.
+
+    A meta file records gameName=SkyrimSE, but IPluginGame.gameName() returns
+    "Skyrim Special Edition" - the short name lives on gameShortName() and the
+    Nexus domain on gameNexusName(). Comparing against only one of those never
+    matches.
+    """
+    names: Set[str] = set()
+    display = ""
+    try:
+        game = organizer.managedGame()
+    except Exception:
+        game = None
+    if game is None:
+        return names, display
+
+    for accessor in ("gameName", "gameShortName", "gameNexusName"):
+        try:
+            value = getattr(game, accessor)()
+        except Exception:
+            continue
+        if value:
+            names.add(str(value).lower())
+            if accessor == "gameName":
+                display = str(value)
+
+    for accessor in ("validShortNames", "primarySources"):
+        try:
+            values = getattr(game, accessor)() or []
+        except Exception:
+            continue
+        for value in values:
+            if value:
+                names.add(str(value).lower())
+
+    return names, display
+
+
+def download_blocker(
+    entry: Entry,
+    managed_names: Set[str],
+    managed_display: str = "",
+    allow_unverified: bool = False,
+) -> str:
+    """Why this entry cannot be fetched automatically, or '' if it can."""
+    if entry.flagged:
+        return "already flagged as removed"
+    if entry.status == ST_SKIPPED:
+        return "source type is not supported"
+    if entry.status not in (ST_OK, ST_CACHED) and not allow_unverified:
+        return "not checked yet - run Check Nexus first, or tick 'fetch unverified'"
+    if entry.kind == KIND_DIRECT:
+        return "" if entry.url else "no URL in the meta file"
+    if entry.kind == KIND_MANUAL:
+        return "manualURL downloads have to be done by hand"
+    if entry.kind == KIND_IPS4:
+        return "ips4 sources are not supported"
+    if entry.kind == KIND_NEXUS:
+        if not entry.file_id:
+            return "no fileID recorded, so the exact file cannot be requested"
+        if managed_names and entry.game and entry.game.lower() not in managed_names:
+            return (
+                f"belongs to {entry.game}; MO2 can only auto-download for the managed "
+                f"game ({managed_display or 'current game'})"
+            )
+        return ""
+    return "unknown source type"
+
+
+class DownloadRunner(QObject):
+    """Queues missing archives through IDownloadManager.
+
+    Nexus files go via startDownloadNexusFile(), which uses MO2's linked
+    account. directURL entries go via startDownloadURLs(). Both return a
+    download ID, so completion callbacks can be matched back to the entry that
+    asked for them rather than guessing.
+    """
+
+    progressed = pyqtSignal(int, int)
+    entryResolved = pyqtSignal(object)
+    logged = pyqtSignal(str)
+    debug = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(
+        self,
+        organizer: mobase.IOrganizer,
+        entries: List[Entry],
+        indices: List[int],
+        max_active: int = 2,
+        restore_meta: bool = True,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._organizer = organizer
+        self._entries = entries
+        self._queue = list(indices)
+        self._total = len(indices)
+        self._done = 0
+        self._max_active = max(1, max_active)
+        self._restore_meta = restore_meta
+        self._stopping = False
+        self._downloads_path = organizer.downloadsPath()
+
+        self._manager = organizer.downloadManager()
+        if self._manager is None:
+            raise RuntimeError("MO2 provided no download manager.")
+
+        self._active: Dict[int, int] = {}      # download ID -> entry index
+        self._pending_ids: Set[int] = set()
+
+        self._poll = QTimer(self)
+        self._poll.setInterval(4000)
+        self._poll.timeout.connect(self._poll_disk)
+
+    @property
+    def total(self) -> int:
+        return self._total
+
+    # -- control -----------------------------------------------------------
+
+    def start(self) -> None:
+        if not self._queue:
+            self.finished.emit()
+            return
+        self._poll.start()
+        self._pump()
+
+    def stop(self) -> None:
+        """Stops queueing. Downloads already handed to MO2 keep running - they
+        are MO2's now, and cancelling them belongs in its Downloads tab."""
+        self._stopping = True
+        remaining = len(self._queue)
+        self._queue.clear()
+        if remaining:
+            self.logged.emit(
+                f"Stopped. {remaining} archive(s) were not queued; downloads already "
+                "handed to MO2 continue in its Downloads tab."
+            )
+        if not self._active:
+            self._finish()
+
+    def _finish(self) -> None:
+        self._poll.stop()
+        self.finished.emit()
+
+    # -- queueing ----------------------------------------------------------
+
+    def _pump(self) -> None:
+        while not self._stopping and self._queue and len(self._active) < self._max_active:
+            index = self._queue.pop(0)
+            self._launch(index)
+        if not self._queue and not self._active:
+            self._finish()
+
+    def _launch(self, index: int) -> None:
+        entry = self._entries[index]
+        try:
+            if entry.kind == KIND_NEXUS:
+                self.debug.emit(
+                    f"-> startDownloadNexusFile(mod={entry.mod_id}, file={entry.file_id})"
+                )
+                download_id = self._manager.startDownloadNexusFile(
+                    int(entry.mod_id), int(entry.file_id)
+                )
+            else:
+                self.debug.emit(f"-> startDownloadURLs([{entry.url}])")
+                download_id = self._manager.startDownloadURLs([entry.url])
+        except Exception as exc:
+            self._settle(index, ST_DL_FAILED, f"MO2 refused the download: {exc}")
+            return
+
+        if download_id is None or int(download_id) < 0:
+            self._settle(
+                index,
+                ST_DL_FAILED,
+                "MO2 returned no download ID. For Nexus files this usually means the "
+                "account is not Premium - the download API is Premium-only.",
+            )
+            return
+
+        download_id = int(download_id)
+        self._active[download_id] = index
+        entry.status = ST_DOWNLOADING
+        entry.reason = f"Queued in MO2 (download #{download_id})"
+        self.entryResolved.emit([index])
+
+    # -- completion --------------------------------------------------------
+
+    def handle_complete(self, download_id: int) -> None:
+        index = self._active.pop(int(download_id), None)
+        if index is None:
+            return
+        entry = self._entries[index]
+        path = ""
+        try:
+            path = self._manager.downloadPath(int(download_id)) or ""
+        except Exception:
+            path = ""
+        if path:
+            entry.archive = os.path.basename(path)
+        self._restore_meta_keys(entry, path)
+        size = ""
+        try:
+            if path and os.path.isfile(path):
+                size = f" ({_human_size(os.path.getsize(path))})"
+        except OSError:
+            size = ""
+        self._settle(index, ST_DOWNLOADED, f"Downloaded{size}", already_removed=True)
+        self._pump()
+
+    def handle_failed(self, download_id: int) -> None:
+        index = self._active.pop(int(download_id), None)
+        if index is None:
+            return
+        self._settle(
+            index,
+            ST_DL_FAILED,
+            "MO2 reported the download as failed - check its Downloads tab for the reason",
+            already_removed=True,
+        )
+        self._pump()
+
+    def _poll_disk(self) -> None:
+        """Backstop in case a completion callback is missed."""
+        for download_id, index in list(self._active.items()):
+            entry = self._entries[index]
+            if entry.archive and not archive_missing(entry, self._downloads_path):
+                self._active.pop(download_id, None)
+                self._settle(
+                    index, ST_DOWNLOADED, "Downloaded (seen on disk)", already_removed=True
+                )
+        self._pump()
+
+    def _settle(
+        self, index: int, status: str, reason: str, already_removed: bool = False
+    ) -> None:
+        entry = self._entries[index]
+        entry.status = status
+        entry.reason = reason
+        if not already_removed:
+            for did, idx in list(self._active.items()):
+                if idx == index:
+                    self._active.pop(did, None)
+        self._done += 1
+        self.progressed.emit(self._done, self._total)
+        self.entryResolved.emit([index])
+
+    def _restore_meta_keys(self, entry: Entry, path: str) -> None:
+        """MO2 writes its own .meta for a fresh download and does not know about
+        directURL, so put it back or Wabbajack loses the source."""
+        if not self._restore_meta or entry.kind not in (KIND_DIRECT, KIND_MANUAL):
+            return
+        if not entry.url:
+            return
+        meta_path = (path + ".meta") if path else ""
+        if not meta_path or not os.path.isdir(os.path.dirname(meta_path)):
+            return
+        try:
+            meta = QSettings(meta_path, QSettings.Format.IniFormat)
+            key = "General/directURL" if entry.kind == KIND_DIRECT else "General/manualURL"
+            if not meta.value(key):
+                meta.setValue(key, entry.url)
+                if entry.kind == KIND_MANUAL and entry.prompt:
+                    meta.setValue("General/prompt", entry.prompt)
+                meta.sync()
+                self.debug.emit(f"   restored {key} in {os.path.basename(meta_path)}")
+        except Exception as exc:
+            self.debug.emit(f"!! could not restore meta keys: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Report writing
 # ---------------------------------------------------------------------------
 
@@ -1270,6 +1659,8 @@ class AvailabilityDialog(QDialog):
         self._entries: List[Entry] = []
         self._checker: Optional[AvailabilityChecker] = None
         self._url_checker: Optional["UrlChecker"] = None
+        self._downloader: Optional["DownloadRunner"] = None
+        self._download_hooks = False
         self._cache: Dict[str, Any] = {}
 
         self.setWindowTitle(PLUGIN_NAME)
@@ -1306,7 +1697,7 @@ class AvailabilityDialog(QDialog):
             "This is what Wabbajack uses to rebuild the list."
         )
         self._chk_mods = QCheckBox("Installed mods with a Nexus ID")
-        self._chk_mods.setChecked(bool(self._setting("include_installed_mods", False)))
+        self._chk_mods.setChecked(bool(self._setting("include_installed_mods", True)))
         self._chk_mods.setToolTip(
             "Catches mods whose archive is no longer in the downloads folder. "
             "Mod-page level only - no file ID to verify."
@@ -1342,17 +1733,38 @@ class AvailabilityDialog(QDialog):
         grid.addWidget(self._chk_links, 2, 0)
         grid.addWidget(self._chk_whitelist, 2, 1)
 
-        grid.addWidget(QLabel("Concurrent requests:"), 3, 0)
+        self._chk_restore_meta = QCheckBox("Restore directURL in .meta after downloading")
+        self._chk_restore_meta.setChecked(True)
+        self._chk_restore_meta.setToolTip(
+            "MO2 writes its own .meta for a fresh download and knows nothing about "
+            "directURL, so Wabbajack would lose the source. This puts the key back."
+        )
+        self._chk_unverified = QCheckBox("Fetch missing archives even if not yet checked")
+        self._chk_unverified.setChecked(False)
+        self._chk_unverified.setToolTip(
+            "Normally only archives confirmed to still exist are queued. Tick this to "
+            "fetch straight after a scan without running the Nexus check first. "
+            "Anything already flagged as removed is still never queued."
+        )
+        grid.addWidget(self._chk_restore_meta, 3, 0)
+        grid.addWidget(self._chk_unverified, 3, 1)
+        grid.addWidget(QLabel("Simultaneous downloads:"), 4, 0)
+        self._spin_downloads = QSpinBox()
+        self._spin_downloads.setRange(1, 8)
+        self._spin_downloads.setValue(int(self._setting("simultaneous_downloads", 2)))
+        grid.addWidget(self._spin_downloads, 4, 1)
+
+        grid.addWidget(QLabel("Concurrent requests:"), 5, 0)
         self._spin_concurrency = QSpinBox()
         self._spin_concurrency.setRange(1, 16)
         self._spin_concurrency.setValue(int(self._setting("max_concurrent_requests", 4)))
-        grid.addWidget(self._spin_concurrency, 3, 1)
+        grid.addWidget(self._spin_concurrency, 5, 1)
 
-        grid.addWidget(QLabel("Skip entries confirmed OK within (days, 0 = never skip):"), 4, 0)
+        grid.addWidget(QLabel("Skip entries confirmed OK within (days, 0 = never skip):"), 6, 0)
         self._spin_cache = QSpinBox()
         self._spin_cache.setRange(0, 365)
         self._spin_cache.setValue(int(self._setting("cache_days", 7)))
-        grid.addWidget(self._spin_cache, 4, 1)
+        grid.addWidget(self._spin_cache, 6, 1)
 
         layout.addWidget(options)
 
@@ -1368,7 +1780,9 @@ class AvailabilityDialog(QDialog):
         controls.addStretch(1)
         controls.addWidget(QLabel("Show:"))
         self._combo_filter = QComboBox()
-        self._combo_filter.addItems(["Everything", "Needs attention", "Errors only"])
+        self._combo_filter.addItems(
+            ["Everything", "Needs attention", "Errors only", "Archive missing"]
+        )
         controls.addWidget(self._combo_filter)
         layout.addLayout(controls)
 
@@ -1380,6 +1794,8 @@ class AvailabilityDialog(QDialog):
         self._table.setHorizontalHeaderLabels(self.COLUMNS)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._table_menu)
         self._table.setSortingEnabled(False)
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -1414,10 +1830,20 @@ class AvailabilityDialog(QDialog):
         bottom = QHBoxLayout()
         self._btn_open = QPushButton("Open selected on Nexus")
         self._btn_copy = QPushButton("Copy flagged URLs")
+        self._btn_download = QPushButton("Download missing")
+        self._btn_download.setEnabled(False)
+        self._btn_manual = QPushButton("Copy manual links")
+        self._btn_manual.setEnabled(False)
+        self._btn_manual.setToolTip(
+            "Copies a clickable download link for every missing archive. Nexus links "
+            "use the mod-manager download form, which works without Premium."
+        )
         self._btn_report = QPushButton("Write report...")
         self._btn_close = QPushButton("Close")
         bottom.addWidget(self._btn_open)
         bottom.addWidget(self._btn_copy)
+        bottom.addWidget(self._btn_download)
+        bottom.addWidget(self._btn_manual)
         bottom.addStretch(1)
         bottom.addWidget(self._btn_report)
         bottom.addWidget(self._btn_close)
@@ -1430,6 +1856,8 @@ class AvailabilityDialog(QDialog):
         self._btn_stop.clicked.connect(self._do_stop)
         self._btn_open.clicked.connect(self._open_selected)
         self._btn_copy.clicked.connect(self._copy_flagged)
+        self._btn_download.clicked.connect(self._do_download)
+        self._btn_manual.clicked.connect(self._copy_manual_links)
         self._btn_report.clicked.connect(self._write_report)
         self._btn_close.clicked.connect(self.accept)
         self._combo_filter.currentIndexChanged.connect(self._apply_filter)
@@ -1572,6 +2000,7 @@ class AvailabilityDialog(QDialog):
 
         self._entries = entries
         self._populate_table()
+        self._refresh_download_button()
 
         pending = [e for e in entries if e.status == ST_PENDING]
         nexus_pending = [e for e in pending if e.kind == KIND_NEXUS]
@@ -1623,6 +2052,7 @@ class AvailabilityDialog(QDialog):
                 "ok": (QColor("#1d3a26"), QColor("#b8e6c2")),
                 "cached": (QColor("#26332c"), QColor("#9dbdaa")),
                 "skip": (QColor("#2e2e33"), QColor("#b0b0b8")),
+                "busy": (QColor("#1e3348"), QColor("#bcd9f5")),
             }
         else:
             self._row_colours = {
@@ -1631,9 +2061,16 @@ class AvailabilityDialog(QDialog):
                 "ok": (QColor("#e3f5e5"), QColor("#12441f")),
                 "cached": (QColor("#eef4ef"), QColor("#3a5442")),
                 "skip": (QColor("#f0f0f2"), QColor("#4a4a52")),
+                "busy": (QColor("#e3eefb"), QColor("#13395e")),
             }
 
     def _colour_for(self, entry: Entry) -> Tuple[QColor, QColor]:
+        if entry.status == ST_DOWNLOADING:
+            return self._row_colours["busy"]
+        if entry.status == ST_DOWNLOADED:
+            return self._row_colours["ok"]
+        if entry.status == ST_DL_FAILED:
+            return self._row_colours["error"]
         if entry.flagged:
             return self._row_colours["flag"]
         if entry.status == ST_ERROR:
@@ -1691,6 +2128,8 @@ class AvailabilityDialog(QDialog):
                 visible = entry.flagged
             elif mode == 2:
                 visible = entry.status == ST_ERROR
+            elif mode == 3:
+                visible = archive_missing(entry, self._organizer.downloadsPath())
             else:
                 visible = True
             self._table.setRowHidden(row, not visible)
@@ -1757,6 +2196,8 @@ class AvailabilityDialog(QDialog):
         self._log(text, force=True)
 
     def _do_stop(self) -> None:
+        if self._downloader is not None:
+            self._downloader.stop()
         if self._url_checker is not None:
             self._url_checker.stop()
         if self._checker is not None:
@@ -1842,8 +2283,274 @@ class AvailabilityDialog(QDialog):
             f"'verify nexus availability', {errors} inconclusive and worth a manual look. "
             "Write a report to hand off to your list build."
         )
+        self._refresh_download_button()
         if flagged or errors:
             self._combo_filter.setCurrentIndex(1 if flagged else 2)
+
+    # -- fetching missing archives ----------------------------------------
+
+    def _managed_game(self) -> Tuple[Set[str], str]:
+        return managed_game_identifiers(self._organizer)
+
+    def _download_candidates(self) -> Tuple[List[int], Dict[str, int]]:
+        """Returns (downloadable indices, {blocker reason: count})."""
+        downloads = self._organizer.downloadsPath()
+        managed_names, managed_display = self._managed_game()
+        indices: List[int] = []
+        blocked: Dict[str, int] = {}
+        for index, entry in enumerate(self._entries):
+            if entry.status in (ST_DOWNLOADING, ST_DOWNLOADED):
+                continue
+            if not archive_missing(entry, downloads):
+                continue
+            reason = download_blocker(
+                entry,
+                managed_names,
+                managed_display,
+                self._chk_unverified.isChecked(),
+            )
+            if reason:
+                blocked[reason] = blocked.get(reason, 0) + 1
+            else:
+                indices.append(index)
+        return indices, blocked
+
+    def _missing_indices(self) -> List[int]:
+        downloads = self._organizer.downloadsPath()
+        return [
+            index
+            for index, entry in enumerate(self._entries)
+            if entry.status not in (ST_DOWNLOADING, ST_DOWNLOADED)
+            and archive_missing(entry, downloads)
+        ]
+
+    def _refresh_download_button(self) -> None:
+        try:
+            indices, blocked = self._download_candidates()
+            missing = self._missing_indices()
+        except Exception:
+            indices, blocked, missing = [], {}, []
+        self._btn_download.setText(f"Download missing ({len(indices)})")
+        # Stays clickable whenever anything is missing: a greyed-out button
+        # explains nothing, and the dialog itemises why entries were skipped.
+        self._btn_download.setEnabled(bool(missing) and self._downloader is None)
+        self._btn_manual.setText(f"Copy manual links ({len(missing)})")
+        self._btn_manual.setEnabled(bool(missing))
+        if missing:
+            summary = ", ".join(f"{count} x {reason}" for reason, count in blocked.items())
+            self._log(
+                f"{len(missing)} archive(s) missing; {len(indices)} can be auto-fetched."
+                + (f" Skipped: {summary}" if summary else ""),
+                force=True,
+            )
+
+    def _ensure_download_hooks(self) -> None:
+        """IDownloadManager handlers are permanent, so install them once and
+        route them to whichever runner is active."""
+        if self._download_hooks:
+            return
+        manager = self._organizer.downloadManager()
+        if manager is None:
+            raise RuntimeError("MO2 provided no download manager.")
+
+        def on_complete(download_id: int) -> None:
+            if self._downloader is not None:
+                self._downloader.handle_complete(download_id)
+
+        def on_failed(download_id: int) -> None:
+            if self._downloader is not None:
+                self._downloader.handle_failed(download_id)
+
+        manager.onDownloadComplete(on_complete)
+        manager.onDownloadFailed(on_failed)
+        self._download_hooks = True
+
+    def _do_download(self) -> None:
+        try:
+            self._start_downloads()
+        except Exception as exc:
+            self._downloader = None
+            self._refresh_download_button()
+            self._report_exception("Download", exc)
+
+    def _start_downloads(self) -> None:
+        indices, blocked = self._download_candidates()
+        if not indices:
+            lines = ["Nothing can be fetched automatically right now."]
+            if blocked:
+                lines += ["", "Missing archives were skipped because:"]
+                lines += [
+                    f"  - {count} x {reason}" for reason, count in blocked.items()
+                ]
+            else:
+                lines += [
+                    "",
+                    "No missing archives were found at all. If you deleted a download "
+                    "from MO2, its .meta went with it - tick 'Installed mods with a "
+                    "Nexus ID' and scan again so the mod is still seen.",
+                ]
+            QMessageBox.information(self, PLUGIN_NAME, "\n".join(lines))
+            return
+
+        nexus_count = sum(
+            1 for i in indices if self._entries[i].kind == KIND_NEXUS
+        )
+        direct_count = len(indices) - nexus_count
+        skipped = "\n".join(f"  - {count} x {reason}" for reason, count in blocked.items())
+
+        message = [
+            f"Queue {len(indices)} missing archive(s) in MO2?",
+            "",
+            f"  - {nexus_count} from Nexus (uses your linked account)",
+            f"  - {direct_count} from directURL links",
+        ]
+        if nexus_count:
+            message += [
+                "",
+                "Nexus API downloads are Premium-only. Without Premium MO2 will fail "
+                "these and you will have to click through the mod pages instead.",
+            ]
+        if skipped:
+            message += ["", "Not queued:", skipped]
+        message += [
+            "",
+            "Downloads run in MO2's Downloads tab and this can pull a lot of data. "
+            "Check your free disk space first.",
+        ]
+
+        if (
+            QMessageBox.question(
+                self,
+                PLUGIN_NAME,
+                "\n".join(message),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+
+        self._launch_runner(indices)
+
+    def _launch_runner(self, indices: List[int]) -> None:
+        self._ensure_download_hooks()
+        self._save_setting("simultaneous_downloads", self._spin_downloads.value())
+
+        self._downloader = DownloadRunner(
+            organizer=self._organizer,
+            entries=self._entries,
+            indices=indices,
+            max_active=self._spin_downloads.value(),
+            restore_meta=self._chk_restore_meta.isChecked(),
+            parent=self,
+        )
+        self._downloader.progressed.connect(self._on_progress)
+        self._downloader.entryResolved.connect(self._on_group)
+        self._downloader.logged.connect(self._on_checker_message)
+        self._downloader.debug.connect(self._log)
+        self._downloader.finished.connect(self._on_downloads_finished)
+
+        self._progress.setRange(0, max(1, len(indices)))
+        self._progress.setValue(0)
+        self._progress.setFormat("%v / %m archives")
+        self._btn_download.setEnabled(False)
+        self._btn_stop.setEnabled(True)
+        self._status_label.setText(f"Fetching {len(indices)} missing archive(s)...")
+        self._log(f"Download phase: {len(indices)} archive(s) queued.", force=True)
+        self._downloader.start()
+
+    def _on_downloads_finished(self) -> None:
+        done = sum(1 for e in self._entries if e.status == ST_DOWNLOADED)
+        failed = sum(1 for e in self._entries if e.status == ST_DL_FAILED)
+        self._downloader = None
+        self._btn_stop.setEnabled(False)
+        self._progress.setFormat("%v / %m")
+        self._status_label.setText(
+            f"Downloads finished: {done} fetched, {failed} failed. "
+            "Anything still running is in MO2's Downloads tab."
+        )
+        self._refresh_download_button()
+
+    def _copy_manual_links(self) -> None:
+        indices = self._missing_indices()
+        if not indices:
+            QMessageBox.information(self, PLUGIN_NAME, "No missing archives.")
+            return
+        lines: List[str] = []
+        for index in indices:
+            entry = self._entries[index]
+            url = manual_download_url(self._organizer, entry)
+            if not url:
+                continue
+            name = entry.mod_name or entry.display_name or entry.archive or f"Mod {entry.mod_id}"
+            lines.append(f"{name}\t{url}")
+        if not lines:
+            QMessageBox.information(self, PLUGIN_NAME, "No usable links for the missing archives.")
+            return
+        QApplication.clipboard().setText("\n".join(lines))
+        self._status_label.setText(
+            f"Copied {len(lines)} download link(s). Nexus links open the mod-manager "
+            "download prompt, which hands the file to MO2 without Premium."
+        )
+
+    def _table_menu(self, position) -> None:
+        entries = self._selected_entries()
+        if not entries:
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction(f"Open download page ({len(entries)})")
+        copy_action = menu.addAction("Copy download link")
+        menu.addSeparator()
+        queue_action = menu.addAction("Queue download in MO2")
+        meta_action = menu.addAction("Copy .meta path")
+
+        chosen = menu.exec(self._table.viewport().mapToGlobal(position))
+        if chosen is None:
+            return
+
+        if chosen is open_action:
+            for entry in entries[:10]:
+                url = manual_download_url(self._organizer, entry)
+                if url:
+                    QDesktopServices.openUrl(QUrl(url))
+        elif chosen is copy_action:
+            urls = [manual_download_url(self._organizer, e) for e in entries]
+            QApplication.clipboard().setText("\n".join(u for u in urls if u))
+            self._status_label.setText(f"Copied {len(urls)} link(s).")
+        elif chosen is meta_action:
+            paths = [e.meta_path for e in entries if e.meta_path]
+            QApplication.clipboard().setText("\n".join(paths))
+            self._status_label.setText(f"Copied {len(paths)} .meta path(s).")
+        elif chosen is queue_action:
+            self._queue_specific(entries)
+
+    def _queue_specific(self, entries: List[Entry]) -> None:
+        """Force-queue the selected rows, ignoring the verification rule."""
+        if self._downloader is not None:
+            QMessageBox.information(self, PLUGIN_NAME, "A download run is already active.")
+            return
+        managed_names, managed_display = self._managed_game()
+        indices: List[int] = []
+        blocked: List[str] = []
+        for entry in entries:
+            reason = download_blocker(
+                entry, managed_names, managed_display, allow_unverified=True
+            )
+            if reason:
+                name = entry.mod_name or entry.display_name or entry.archive
+                blocked.append(f"{name}: {reason}")
+            else:
+                indices.append(self._entries.index(entry))
+        if not indices:
+            QMessageBox.information(
+                self,
+                PLUGIN_NAME,
+                "None of the selected rows can be auto-downloaded:\n\n"
+                + "\n".join(blocked[:12])
+                + "\n\nUse 'Open download page' instead.",
+            )
+            return
+        self._launch_runner(indices)
 
     # -- actions -----------------------------------------------------------
 
@@ -1853,7 +2560,9 @@ class AvailabilityDialog(QDialog):
 
     def _open_selected(self) -> None:
         for entry in self._selected_entries()[:10]:
-            QDesktopServices.openUrl(QUrl(mod_url(self._organizer, entry)))
+            url = manual_download_url(self._organizer, entry)
+            if url:
+                QDesktopServices.openUrl(QUrl(url))
 
     def _copy_flagged(self) -> None:
         urls = sorted(
@@ -1938,7 +2647,7 @@ class NexusAvailabilityCheck(mobase.IPluginTool):
             mobase.PluginSetting(
                 "include_installed_mods",
                 "Also check installed mods that carry a Nexus ID.",
-                False,
+                True,
             ),
         ]
 
